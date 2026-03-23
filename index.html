@@ -281,8 +281,11 @@ let seqTimer = null, rafId = null;
 let nextStepTime = 0, curStep = 0, totalSteps = 16;
 let lastVisStep = -1;
 
-// Choke: one BufferSourceNode per bank
-const chokeNode = { A:null, B:null, C:null, D:null };
+// Polyphony: A & B allow up to 8 simultaneous voices (FIFO queue).
+// C & D keep choke (one voice — chords don't stack well).
+const POLY_LIMIT = 8;
+const polyQueue = { A:[], B:[] };          // array of active BufferSourceNodes
+const chokeNode = { C:null, D:null };      // single-voice choke for C & D
 
 // 16 AudioBuffers per bank
 const bankBufs = { A:[], B:[], C:[], D:[] };
@@ -302,7 +305,7 @@ const bankNames = {
 const PAD_NAMES = {
   A:['KICK 1','SNARE 1','HH CL','HH OP','CLAP','TOM H','TOM L','RIM','SNAP','KICK 2','SNARE 2','HH GH','CLAP 2','CRASH','RIDE','SHKR'],
   B:['BS E1','BS E2','BS E3','BS E4','BS G1','BS G2','BS A1','BS A2','BS C2','BS D2','BS E5','BS F#','BS A3','BS B1','BS C3','BS D3'],
-  C:['Cmaj9','Dm9','Ebmaj7#11','Fmaj9','Gm9','Abmaj7','Bb13','Am11','Cmaj7/E','Em7b5','Fmaj9/A','G7sus4','Dm7/F','Ebmaj9','Cm9','Bb/D'],
+  C:['Ebmaj9','Cm11','Fm9','Bb13sus','Gm11','Cm7','Abmaj7#11','Bb7#9','Ebmaj7/G','Fm7/Ab','Bb9sus','Eb6/9','Dbmaj9','Abmaj7','Bb13','Ebmaj9'],
   D:['Fm9','Gbmaj7#11','Abmaj9','Bbm11','Ebmaj9/G','Cm9','Dbmaj7','Dm7b5','Ab13','Gm9','Fm7/Ab','Eb/Bb','Dbmaj9','Bbm7','Abmaj7/C','Eb9sus'],
 };
 
@@ -607,18 +610,56 @@ async function makeKeys(midiNote) {
   return buf;
 }
 
-// ── NEO SOUL CHORD VOICINGS for Bank C ─────────────────
-// Each entry: [root, ...intervals in semitones above root]
-// All voiced in a lush, spread neo-soul style (Dilla, Questlove, D'Angelo)
+// ── NEO SOUL CHORD PROGRESSION for Bank C ──────────────
+// A genuine 16-chord neo-soul progression in Eb, with real
+// harmonic movement, voice leading, borrowed chords and subs.
+// Inspired by D'Angelo "Brown Sugar" / Erykah Badu / Hiatus Kaiyote
+//
+// Pad:  1         2           3             4
+//       Ebmaj9    Cm11        Fm9           Bb13sus
+// Pad:  5         6           7             8
+//       Gm11      Cm7         Abmaj7#11     Bb7#9
+// Pad:  9         10          11            12
+//       Ebmaj7/G  Fm7/Ab      Bb9sus        Eb6/9
+// Pad:  13        14          15            16
+//       Dbmaj9    Abmaj7      Bb13          Ebmaj9(no3)
+//
+// All voiced with shell voicings + upper extensions, spread
+// across the sweet zone of the Rhodes (Eb3–Bb5).
+
 const NEO_SOUL_CHORDS_C = [
-  // Cmaj9         Dm9           Ebmaj7#11      Fmaj9
-  [60,64,67,71,74],[62,65,69,72,76],[63,67,70,74,77],[65,69,72,76,79],
-  // Gm9           Abmaj7        Bb13          Am11
-  [67,70,74,77,81],[68,72,75,79,82],[70,74,77,81,84],[69,72,76,79,83],
-  // Cmaj7/E       Em7b5         Fmaj9/A       G7sus4
-  [64,67,71,72,76],[64,67,70,74,77],[69,72,76,79,84],[67,70,72,77,81],
-  // Dm7/F         Ebmaj9        Cm9           Bb/D
-  [65,69,72,77,80],[63,67,70,75,79],[60,63,67,70,74],[62,65,70,74,77],
+  // 1  Ebmaj9:   Eb  G  Bb  D  F   (root pos, open voiced)
+  [63, 67, 70, 74, 77],
+  // 2  Cm11:     C  Eb  G  Bb  F   (minor 11, no 9 — dark and full)
+  [60, 63, 67, 70, 77],
+  // 3  Fm9:      F  Ab  C  Eb  G   (minor 9, classic neo-soul ii)
+  [65, 68, 72, 75, 79],
+  // 4  Bb13sus:  Bb  Eb  F  Ab  G  (sus4 + 13, Dilla favourite)
+  [70, 75, 77, 80, 79],
+  // 5  Gm11:     G  Bb  D  F  C   (iii minor 11, airy upper stack)
+  [67, 70, 74, 77, 84],
+  // 6  Cm7:      C  Eb  G  Bb     (clean minor 7, grounded resolution)
+  [60, 63, 67, 70, 75],
+  // 7  Abmaj7#11: Ab  C  Eb  G  D  (lydian maj7, floaty borrowed IV)
+  [68, 72, 75, 79, 74],
+  // 8  Bb7#9:    Bb  D  F  Ab  C# (dominant #9 "Hendrix chord" — tension)
+  [70, 74, 77, 80, 75],
+  // 9  Ebmaj7/G: G  Bb  D  Eb  F  (first inversion, smooth voice lead)
+  [67, 70, 74, 75, 77],
+  // 10 Fm7/Ab:   Ab  C  Eb  F     (second inversion, bass movement)
+  [68, 72, 75, 77, 80],
+  // 11 Bb9sus:   Bb  Eb  F  Ab    (suspended 9, half cadence breath)
+  [70, 75, 77, 80, 82],
+  // 12 Eb6/9:    Eb  G  Bb  C  F  (major 6/9, bright release)
+  [63, 67, 70, 72, 77],
+  // 13 Dbmaj9:   Db  F  Ab  C  Eb (bVII maj9 — borrowed, very neo-soul)
+  [61, 65, 68, 72, 75],
+  // 14 Abmaj7:   Ab  C  Eb  G     (IV maj7, warm and resolved)
+  [68, 72, 75, 79, 82],
+  // 15 Bb13:     Bb  D  F  Ab  G  (dominant 13, pulling back home)
+  [70, 74, 77, 80, 79],
+  // 16 Ebmaj9(no3): Eb  Bb  D  F  (open no-3rd ending, ambiguous beauty)
+  [63, 70, 74, 77, 82],
 ];
 
 async function makeChordRhodes(notes) {
@@ -941,23 +982,20 @@ function trigPad(bank, idx, vel, audioTime) {
   if(!buf) return;
   const when = (audioTime !== undefined) ? audioTime : c.currentTime;
 
-  // CHOKE: stop previous source in this bank
-  if(chokeNode[bank]) {
-    try { chokeNode[bank].stop(when); } catch(e) {}
-    chokeNode[bank] = null;
-  }
-
   const src = c.createBufferSource();
   src.buffer = buf;
 
   const gainNode = c.createGain();
   gainNode.gain.setValueAtTime(vel, when);
 
-  // Per-bank EQ/comp shaping
+  // Per-bank compressor shaping
   const comp = c.createDynamicsCompressor();
   if(bank === 'A') {
     comp.threshold.value = -10; comp.knee.value = 2;
     comp.ratio.value = 16; comp.attack.value = 0.0005; comp.release.value = 0.04;
+  } else if(bank === 'B') {
+    comp.threshold.value = -14; comp.knee.value = 4;
+    comp.ratio.value = 6; comp.attack.value = 0.002; comp.release.value = 0.15;
   } else {
     comp.threshold.value = -18; comp.knee.value = 8;
     comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.2;
@@ -967,7 +1005,33 @@ function trigPad(bank, idx, vel, audioTime) {
   gainNode.connect(comp);
   comp.connect(masterIn);
   src.start(when);
-  chokeNode[bank] = src;
+
+  if(bank === 'A' || bank === 'B') {
+    // Polyphonic: add to queue, evict oldest if over limit
+    const q = polyQueue[bank];
+    q.push(src);
+    if(q.length > POLY_LIMIT) {
+      const oldest = q.shift();
+      // Fade out oldest voice quickly to avoid clicks
+      try {
+        const fadeGain = c.createGain();
+        fadeGain.gain.setValueAtTime(1, c.currentTime);
+        fadeGain.gain.linearRampToValueAtTime(0, c.currentTime + 0.015);
+        oldest.stop(c.currentTime + 0.016);
+      } catch(e) {}
+    }
+    // Clean up finished sources from queue automatically
+    src.onended = () => {
+      const i = q.indexOf(src);
+      if(i !== -1) q.splice(i, 1);
+    };
+  } else {
+    // Choke: C & D are single-voice (chords shouldn't layer)
+    if(chokeNode[bank]) {
+      try { chokeNode[bank].stop(when); } catch(e) {}
+    }
+    chokeNode[bank] = src;
+  }
 
   if(audioTime === undefined && bank === curBank) flashPad(idx, vel);
 }
@@ -1164,10 +1228,10 @@ function buildSeqGrid() {
     hdr.appendChild(d);
   }
 
-  // 16 rows
+  // 16 rows — rendered bottom-to-top (pad 1/kick at bottom, pad 16 at top)
   const rowsEl = document.getElementById('seq-rows');
   rowsEl.innerHTML = '';
-  for(let pi=0;pi<16;pi++) {
+  for(let pi=15;pi>=0;pi--) {
     const row = document.createElement('div');
     row.className = 'seq-row';
 
